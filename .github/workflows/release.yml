@@ -1,0 +1,111 @@
+name: Release
+
+# Run from the Actions tab on main. The tag is created only after the full CI
+# pipeline passes on that commit: once a version reaches proxy.golang.org and
+# sum.golang.org it is permanent (fix mistakes with a new version + retract).
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: Module to release
+        type: choice
+        options: [core, redisengine]
+        required: true
+      version:
+        description: Semantic version, for example v0.1.0 or v0.2.0-rc.1
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  CORE_MODULE: github.com/ivannguyendev/throttle-go
+
+jobs:
+  verify:
+    name: Verify
+    # Fail fast on a wrong ref instead of after a full CI run.
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Tag, release and publish
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      MODULE: ${{ inputs.module }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache-dependency-path: '**/go.sum'
+
+      - name: Validate the request
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Release from main only (got $GITHUB_REF)"; exit 1
+          fi
+          if ! [[ "$VERSION" =~ ^v(0|1)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$VERSION is not a v0/v1 semantic version (v2+ needs a /v2 module path)"; exit 1
+          fi
+          case "$MODULE" in
+            core)        tag="$VERSION";             path="$CORE_MODULE" ;;
+            redisengine) tag="redisengine/$VERSION"; path="$CORE_MODULE/redisengine" ;;
+          esac
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists"; exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "MODULE_PATH=$path" >> "$GITHUB_ENV"
+
+      # redisengine keeps `replace => ../` for development; consumers ignore
+      # it, so the core version it requires must already be published.
+      - name: redisengine requires a published core
+        if: inputs.module == 'redisengine'
+        run: |
+          core=$(go mod edit -json redisengine/go.mod | jq -r --arg m "$CORE_MODULE" '.Require[] | select(.Path == $m) | .Version')
+          if ! git rev-parse -q --verify "refs/tags/$core" >/dev/null; then
+            echo "::error::redisengine requires $CORE_MODULE $core, which is not a released tag. Release core first, then bump the require."; exit 1
+          fi
+          tmp=$(mktemp -d)
+          cp -R redisengine/. "$tmp"
+          cd "$tmp"
+          go mod edit -dropreplace="$CORE_MODULE"
+          GOFLAGS=-mod=mod GOWORK=off go build ./...
+
+      - name: Create the tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$MODULE_PATH $VERSION"
+          git push origin "$TAG"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=(--verify-tag --generate-notes --title "$TAG")
+          if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "${flags[@]}"
+
+      # Fetching through the proxy makes the version available on
+      # proxy.golang.org and pkg.go.dev right away.
+      - name: Publish to the Go module proxy
+        working-directory: ${{ runner.temp }}
+        run: |
+          GOPROXY=https://proxy.golang.org go list -m "$MODULE_PATH@$VERSION" \
+            || echo "::warning::Proxy warm-up failed; pkg.go.dev picks the tag up on the first go get."

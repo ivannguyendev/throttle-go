@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # release.yml runs this exact pipeline before it creates a tag.
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A new push to the same PR cancels the stale run; runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-ci
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Test with exactly the Go version the matrix asks for, never a newer
+  # toolchain downloaded because of the go line.
+  GOTOOLCHAIN: local
+  GOLANGCI_LINT_VERSION: v2.14.0
+  GOVULNCHECK_VERSION: v1.8.0
+
+jobs:
+  lint:
+    name: Lint (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [., redisengine]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache-dependency-path: '**/go.sum'
+
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: go vet
+        run: go vet ./...
+
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          working-directory: ${{ matrix.module }}
+          args: --config=${{ github.workspace }}/.golangci.yaml
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
+
+  test:
+    name: Test (go ${{ matrix.go }}, ${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go: [1.26.x, 1.27.x]
+        module: [., redisengine]
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: '**/go.sum'
+
+      - name: Test (race, shuffled)
+        run: go test -race -shuffle=on -count=1 -coverprofile=coverage.out ./...
+
+      # Allocation budgets are excluded from race builds; run them plain.
+      - name: Allocation budgets
+        run: go test -count=1 -run 'Alloc|Budget' ./...
+
+      - name: Benchmarks compile and run once
+        run: go test -run '^$' -bench . -benchtime 1x ./...
+
+      - name: Coverage summary
+        run: |
+          {
+            echo "### Coverage: ${{ matrix.module }} (go ${{ matrix.go }})"
+            go tool cover -func=coverage.out | tail -1
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  fuzz:
+    name: Fuzz parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache-dependency-path: '**/go.sum'
+
+      - run: go test -run '^$' -fuzz FuzzParseWindowEnd -fuzztime 30s ./throttle
+
+  integration:
+    name: Integration (Redis 7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    defaults:
+      run:
+        working-directory: redisengine
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.27.x
+          cache-dependency-path: '**/go.sum'
+
+      - name: Test against a real Redis
+        env:
+          REDIS_ADDR: localhost:6379
+        run: go test -race -count=1 -run Integration -v ./...

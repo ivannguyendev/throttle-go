@@ -1,0 +1,57 @@
+# Lint policy (golangci-lint v2). Each linter beyond the standard set catches
+# a class of bug or a review argument nobody should have to repeat by hand.
+# Shared by both modules (core and redisengine).
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - fatcontext   # contexts re-wrapped in loops grow without bound
+    - errorlint    # == / type switches on wrapped errors
+    - errname      # ErrXxx sentinels, XxxError types
+    - nilerr       # returning nil after checking err != nil
+    - gosec        # security footguns
+    - sloglint     # consistent slog usage
+    - exhaustive   # switches over enums must handle every value
+    - gocritic     # bug-prone and wasteful constructs
+    - revive       # naming, doc comments on exported identifiers
+    - misspell
+    - unconvert
+    - perfsprint   # fmt.Sprintf where strconv / concatenation is cheaper
+    - intrange     # for i := range n
+    - modernize    # newer stdlib and language features
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment # struct layout is tuned by hand where it matters (shard padding)
+        - shadow         # `err` shadowing is idiomatic and flagged too often
+    sloglint:
+      no-mixed-args: true
+    exhaustive:
+      default-signifies-exhaustive: true
+    revive:
+      rules:
+        - name: exported
+        - name: package-comments
+        - name: context-as-argument
+        - name: error-return
+        - name: error-naming
+        - name: receiver-naming
+        - name: unused-parameter
+        - name: var-naming
+  exclusions:
+    generated: lax
+    presets: [common-false-positives, std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [gosec, revive]
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/ivannguyendev/throttle-go]
